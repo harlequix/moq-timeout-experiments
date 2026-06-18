@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# netns-teardown.sh — Remove network namespace and veth pair.
+# netns-teardown.sh - remove network namespace and veth pair.
 # Must be run as root (sudo).
 set -euo pipefail
 

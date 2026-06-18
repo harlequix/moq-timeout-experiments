@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# run-experiment.sh — Run a single MoQ timeout experiment.
+# run-experiment.sh - run a single MoQ timeout experiment.
 #
 # Prerequisites:
 #   1. sudo ./netns-setup.sh  (creates network namespace)
-#   2. Build binaries: (cd ../testbed && go build -o ../experiment/ ./cmd/...)
-#      or run from testbed dir
+#   2. Prebuilt publisher/relay/subscriber binaries in BIN_DIR
+#      (defaults to this directory; override in .env)
 #   3. Video file (H.264) exists
 #
 # Usage:
@@ -18,13 +18,6 @@
 #     --duration 30 \
 #     --outdir ./results/exp001 \
 #     --subscribers 2
-#
-# The script:
-#   1. Configures netem on the veth inside the namespace
-#   2. Starts publisher on host (localhost:4443)
-#   3. Starts relay on host (upstream=localhost:4443, downstream=10.0.0.1:4444)
-#   4. Starts N subscribers inside the namespace
-#   5. Waits for duration, then collects results
 
 set -euo pipefail
 
@@ -95,42 +88,37 @@ else
     HOST_IP="10.0.0.1"
 fi
 
-# Resolve binary paths — build into experiment dir if missing or stale
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TESTBED_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-build_bin() {
-    local cmd="$1"
-    local out="$SCRIPT_DIR/$cmd"
-    # Rebuild if binary missing or any .go source is newer
-    local newest_src
-    newest_src=$(find "$TESTBED_DIR" -name '*.go' -newer "$out" 2>/dev/null | head -1)
-    if [[ ! -x "$out" || -n "$newest_src" ]]; then
-        echo "Building $cmd..." >&2
-        (cd "$TESTBED_DIR" && go build -o "$out" "./cmd/$cmd/") || { echo "Build failed: $cmd" >&2; exit 1; }
+# Optional local override: BIN_DIR (see .env.example)
+[[ -f "$SCRIPT_DIR/.env" ]] && source "$SCRIPT_DIR/.env"
+BIN_DIR="${BIN_DIR:-$SCRIPT_DIR}"
+
+resolve_bin() {
+    local bin="$BIN_DIR/$1"
+    if [[ ! -x "$bin" ]]; then
+        echo "Error: binary not found or not executable: $bin" >&2
+        echo "  Set BIN_DIR in .env or drop the prebuilt binaries in $BIN_DIR" >&2
+        exit 1
     fi
-    echo "$out"
+    echo "$bin"
 }
 
-PUB_BIN=$(build_bin "publisher")
-RELAY_BIN=$(build_bin "relay")
-SUB_BIN=$(build_bin "subscriber")
+PUB_BIN=$(resolve_bin "publisher")
+RELAY_BIN=$(resolve_bin "relay")
+SUB_BIN=$(resolve_bin "subscriber")
 
-# Get the actual user (since we're running under sudo)
 REAL_USER="${SUDO_USER:-$(whoami)}"
 
-# --- Setup output directory ---
 mkdir -p "$OUTDIR"
 chown "$REAL_USER":"$(id -gn "$REAL_USER")" "$OUTDIR"
 
-# Probe video metadata
 VIDEO_RES=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$VIDEO")
 VIDEO_BITRATE=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=bit_rate -of csv=p=0 "$VIDEO")
 VIDEO_CODEC=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=codec_name,profile -of csv=p=0 "$VIDEO")
 VIDEO_FPS=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 "$VIDEO")
 VIDEO_FRAMES=$(ffprobe -v quiet -select_streams v:0 -show_entries stream=nb_frames -of csv=p=0 "$VIDEO")
 
-# Write experiment metadata
 cat > "$OUTDIR/experiment.json" <<METADATA
 {
     "video": "$VIDEO",
@@ -168,8 +156,7 @@ echo "  Bin dir:     $(dirname "$PUB_BIN")"
 echo "  Output:      $OUTDIR"
 echo ""
 
-# --- Configure netem on veth-host (data path: relay → subscriber) ---
-# Remove existing qdisc first (ignore errors)
+# --- Configure netem on veth-host ---
 tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
 
 NETEM_ARGS="delay $DELAY"
@@ -178,7 +165,6 @@ if [[ "$LOSS" != "0" ]]; then
 fi
 
 if [[ -n "$BANDWIDTH" && "$BANDWIDTH" != "unlimited" ]]; then
-    # Use HTB for rate limiting + netem for delay/loss
     tc qdisc add dev "$VETH_HOST" root handle 1: htb default 10
     tc class add dev "$VETH_HOST" parent 1: classid 1:10 htb rate "$BANDWIDTH"
     tc qdisc add dev "$VETH_HOST" parent 1:10 handle 10: netem $NETEM_ARGS
@@ -188,7 +174,7 @@ fi
 
 echo "netem configured: $NETEM_ARGS ${BANDWIDTH:+rate $BANDWIDTH}"
 
-# --- Connectivity check (retry up to 5 times; tc qdisc replacement can cause transient failures) ---
+# --- Connectivity check ---
 echo "Checking namespace connectivity..."
 PING_OK=0
 for attempt in 1 2 3 4 5; do
@@ -204,12 +190,10 @@ if [[ "$PING_OK" -eq 0 ]]; then
     echo "  - Check namespace setup: sudo ./netns-setup.sh"
     exit 1
 fi
-# UDP check: send a single datagram to the relay port and verify it isn't rejected.
-# Start a short-lived UDP listener, send a packet from the namespace, check arrival.
+# UDP reachability check
 UDP_OK=0
 timeout 2 bash -c "exec 3<>/dev/udp/$HOST_IP/$RELAY_PORT" 2>/dev/null && UDP_OK=1 || true
 if [[ "$UDP_OK" -eq 0 ]]; then
-    # More reliable: use socat/nc to actually test from inside the namespace
     if command -v socat >/dev/null 2>&1; then
         socat -u UDP-LISTEN:$RELAY_PORT,reuseaddr STDOUT &
         PROBE_PID=$!
@@ -226,7 +210,6 @@ if [[ "$UDP_OK" -eq 0 ]]; then
 fi
 echo "Connectivity OK: $NS -> $HOST_IP (ICMP + UDP)"
 
-# --- Cleanup function ---
 PIDS=()
 cleanup() {
     echo ""
@@ -234,19 +217,17 @@ cleanup() {
     for pid in "${PIDS[@]}"; do
         kill "$pid" 2>/dev/null || true
     done
-    # Wait for graceful shutdown (relay needs time to drain forward loops and write metrics)
+    # give the relay time to drain forward loops and write metrics
     sleep 5
     for pid in "${PIDS[@]}"; do
         kill -9 "$pid" 2>/dev/null || true
     done
     wait 2>/dev/null || true
-    # Fix output file ownership
     chown -R "$REAL_USER":"$(id -gn "$REAL_USER")" "$OUTDIR" 2>/dev/null || true
     echo "Results in: $OUTDIR"
 }
 trap cleanup EXIT
 
-# --- Helper: wait for a log message (up to 10s) ---
 wait_for_log() {
     local logfile="$1" pattern="$2" label="$3"
     for attempt in $(seq 1 100); do
@@ -259,7 +240,7 @@ wait_for_log() {
     return 1
 }
 
-# --- Start publisher (listens, ffmpeg starts on first SUBSCRIBE) ---
+# --- Start publisher ---
 echo "Starting publisher..."
 sudo -u "$REAL_USER" "$PUB_BIN" \
     --listen "127.0.0.1:$PUB_PORT" \
@@ -274,7 +255,7 @@ sudo -u "$REAL_USER" "$PUB_BIN" \
 PIDS+=($!)
 wait_for_log "$OUTDIR/publisher.log" "publisher listening" "publisher ready" || true
 
-# --- Start relay (listens immediately, connects upstream on first SUBSCRIBE) ---
+# --- Start relay ---
 echo "Starting relay..."
 QLOG_ARGS=""
 if [[ -n "$QLOG" ]]; then
@@ -294,7 +275,7 @@ sudo -u "$REAL_USER" "$RELAY_BIN" \
 PIDS+=($!)
 wait_for_log "$OUTDIR/relay.log" "listening for subscribers" "relay ready" || true
 
-# --- Start subscribers (triggers: sub->relay->publisher->ffmpeg) ---
+# --- Start subscribers ---
 for i in $(seq 1 "$NUM_SUBS"); do
     echo "Starting subscriber $i..."
     SUB_EXTRA=""
@@ -331,7 +312,6 @@ echo ""
 echo "=== Results ==="
 echo ""
 
-# Print summary
 for i in $(seq 1 "$NUM_SUBS"); do
     recv="$OUTDIR/sub${i}_recv.csv"
     if [[ -f "$recv" ]]; then
@@ -342,7 +322,6 @@ for i in $(seq 1 "$NUM_SUBS"); do
     fi
 done
 
-# Relay in/out summary
 relay_in=""
 relay_drops=""
 if [[ -f "$OUTDIR/relay.log" ]]; then
@@ -359,4 +338,4 @@ if [[ -f "$OUTDIR/manifest.csv" ]]; then
     pub_rows=$(tail -n +2 "$OUTDIR/manifest.csv" | wc -l | tr -d ' ')
 fi
 
-echo "  Pipeline: pub=${pub_rows:-?} → relay_in=${relay_in:-?} → relay_out=${relay_out:-?} → sub (chan_drops=${relay_drops:-?})"
+echo "  Pipeline: pub=${pub_rows:-?} -> relay_in=${relay_in:-?} -> relay_out=${relay_out:-?} -> sub (chan_drops=${relay_drops:-?})"

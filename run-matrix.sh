@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-matrix.sh — Run the full experiment matrix for the ANRW paper.
+# run-matrix.sh - run the full experiment matrix for the ANRW paper.
 #
 # Usage:
 #   sudo ./run-matrix.sh --video /path/to/video.mp4 [--duration 30] [--repeats 3]
@@ -7,7 +7,7 @@
 #   sudo ./run-matrix.sh --video ... --conditions severe,severe-light  # run only selected conditions
 #
 # Matrix dimensions:
-#   Network conditions × (none + strategies × timeouts) × repeats
+#   Network conditions x (none + strategies x timeouts) x repeats
 #
 # "none" strategy always uses timeout=0 (fully reliable).
 # Timeout strategies are crossed with all timeout values.
@@ -32,8 +32,9 @@ while [[ $# -gt 0 ]]; do
         --repeats)    REPEATS="$2"; shift 2;;
         --parallel)   PARALLEL="$2"; shift 2;;
         --outdir)     BASE_OUTDIR="$2"; shift 2;;
-        --conditions) FILTER_CONDITIONS="$2"; shift 2;;
-        --qlog)       QLOG="--qlog"; shift;;
+        --conditions)      FILTER_CONDITIONS="$2"; shift 2;;
+        --conditions-file) CONDITIONS_FILE="$2"; shift 2;;
+        --qlog)            QLOG="--qlog"; shift;;
         *)            echo "Unknown arg: $1"; exit 1;;
     esac
 done
@@ -45,18 +46,17 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# --- Network conditions ---
-# Format: name delay loss bandwidth
-# Netem is applied on veth-host (data path: relay → subscriber).
-CONDITIONS=(
-    "baseline      50ms  0  unlimited"
-    "lossy         50ms  2  unlimited"
-    "congested     50ms  0  1mbit"
-    "severe-light  50ms  2  1mbit"
-    "severe        50ms  5  1mbit"
-)
+CONDITIONS_FILE="${CONDITIONS_FILE:-$SCRIPT_DIR/conditions.conf}"
+if [[ ! -f "$CONDITIONS_FILE" ]]; then
+    echo "Error: conditions file not found: $CONDITIONS_FILE"
+    exit 1
+fi
+CONDITIONS=()
+while IFS= read -r line; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    CONDITIONS+=("$line")
+done < "$CONDITIONS_FILE"
 
-# --- Filter conditions if --conditions was given (comma-separated) ---
 if [[ -n "$FILTER_CONDITIONS" ]]; then
     FILTERED=()
     IFS=',' read -ra WANTED <<< "$FILTER_CONDITIONS"
@@ -77,16 +77,14 @@ if [[ -n "$FILTER_CONDITIONS" ]]; then
     CONDITIONS=("${FILTERED[@]}")
 fi
 
-# --- Timeout strategies (excluding "none") ---
+# Timeout strategies (excluding "none")
 TIMEOUT_STRATEGIES=(
     "reset-stream"
     "reset-at-object"
     "reset-at-keyframe"
 )
 
-# --- Per-object delivery timeouts ---
-# At 30fps (~33ms/object), timeout fires when forward loop falls behind by:
-#   100ms → ~3 objects,  200ms → ~6,  500ms → ~15,  1000ms → ~30 (~1 GoP)
+# Per-object delivery timeouts
 TIMEOUTS=(
     "100ms"
     "200ms"
@@ -94,7 +92,6 @@ TIMEOUTS=(
     "1000ms"
 )
 
-# Count total runs: conditions × (1 none + strategies × timeouts) × repeats
 combos_per_cond=$(( 1 + ${#TIMEOUT_STRATEGIES[@]} * ${#TIMEOUTS[@]} ))
 total=$(( ${#CONDITIONS[@]} * combos_per_cond * REPEATS ))
 
@@ -118,7 +115,7 @@ EOF
 
 echo "=== MoQ Experiment Matrix ==="
 echo "  Conditions:  ${#CONDITIONS[@]}"
-echo "  Strategies:  none + ${#TIMEOUT_STRATEGIES[@]} × ${#TIMEOUTS[@]} timeouts"
+echo "  Strategies:  none + ${#TIMEOUT_STRATEGIES[@]} x ${#TIMEOUTS[@]} timeouts"
 echo "  Combos/cond: $combos_per_cond"
 echo "  Repeats:     $REPEATS"
 echo "  Total runs:  $total"
@@ -132,8 +129,7 @@ fi
 echo "  Output:      $BASE_OUTDIR"
 echo ""
 
-# --- Build job list ---
-# Each job is: cond_name delay loss bw strategy timeout
+# Build job list (each job: cond_name delay loss bw strategy timeout)
 JOBS=()
 for cond_line in "${CONDITIONS[@]}"; do
     read -r cond_name delay loss bw <<< "$cond_line"
@@ -145,7 +141,6 @@ for cond_line in "${CONDITIONS[@]}"; do
     done
 done
 
-# --- Run function for a single job × repeat ---
 run_one() {
     local job_num="$1" cond_name="$2" delay="$3" loss="$4" bw="$5" strategy="$6" timeout="$7" rep="$8"
     local slot_arg=""
@@ -179,10 +174,7 @@ run_one() {
     echo ""
 }
 
-# --- Sequential mode (default) ---
-# Outer loop = repetitions, inner loop = configurations.
-# This spreads each config's reps across time so that a transient system
-# event (e.g. background update) doesn't taint all reps of one config.
+# Sequential mode (default): loop reps outermost so a transient event can't taint all reps of one config.
 if [[ "$PARALLEL" -le 0 ]]; then
     run=0
     for rep in $(seq 1 "$REPEATS"); do
@@ -201,8 +193,7 @@ if [[ "$PARALLEL" -le 0 ]]; then
     exit 0
 fi
 
-# --- Parallel mode ---
-# Verify namespaces exist
+# Parallel mode
 for s in $(seq 0 $((PARALLEL - 1))); do
     if ! ip netns list | grep -q "moq-sub-${s}"; then
         echo "Error: namespace moq-sub-${s} not found. Run: sudo ./netns-setup-parallel.sh $PARALLEL"
@@ -210,7 +201,6 @@ for s in $(seq 0 $((PARALLEL - 1))); do
     fi
 done
 
-# Expand jobs × repeats into a flat queue
 QUEUE=()
 run=0
 for job_line in "${JOBS[@]}"; do
@@ -221,10 +211,8 @@ for job_line in "${JOBS[@]}"; do
     done
 done
 
-# Dispatch to slots using a semaphore pattern
 SLOT_PIDS=()
 next_slot() {
-    # Wait for any slot to free up, return its index
     while true; do
         for s in $(seq 0 $((PARALLEL - 1))); do
             if [[ -z "${SLOT_PIDS[$s]:-}" ]] || ! kill -0 "${SLOT_PIDS[$s]}" 2>/dev/null; then
@@ -243,7 +231,6 @@ for queue_entry in "${QUEUE[@]}"; do
     SLOT_PIDS[$slot]=$!
 done
 
-# Wait for all remaining slots
 wait
 
 chown -R "$REAL_USER":"$(id -gn "$REAL_USER")" "$BASE_OUTDIR"
