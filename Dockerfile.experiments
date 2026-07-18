@@ -8,7 +8,8 @@ RUN go build -o /out/moq-publisher ./cmd/publisher/ && go build -o /out/moq-rela
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends mpv ffmpeg iproute2 procps bsdextrautils libcap2-bin ca-certificates && rm -rf /var/lib/apt/lists/* && setcap cap_net_admin+ep "$(readlink -f "$(which tc)")"
 COPY --from=build /out/ /usr/local/bin/
-COPY moq-streaming/run-test.sh moq-streaming/net-shape.sh moq-streaming/exp-entry.sh /moq/
+COPY moq-streaming/run-test.sh /moq/
+COPY moq-timeout-experiments/net-shape.sh moq-timeout-experiments/exp-entry.sh /moq/
 COPY moq-streaming/subscriber/framelog.lua /moq/subscriber/framelog.lua
 WORKDIR /moq
 ENV PATH="/moq:${PATH}"

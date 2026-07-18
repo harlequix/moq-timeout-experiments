@@ -6,3 +6,6 @@ moq-streaming/results
 moq-streaming/moq-publisher
 moq-streaming/moq-relay
 moq-streaming/moq-subscriber
+!moq-timeout-experiments/net-shape.sh
+!moq-timeout-experiments/exp-entry.sh
+moq-streaming/third_party/quic-go/.git
