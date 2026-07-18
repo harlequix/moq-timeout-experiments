@@ -50,6 +50,28 @@ Network conditions are defined in `conditions.conf`. Output lands under
 per-subscriber receive and display CSVs that the dataset's analysis pipeline
 consumes.
 
+## Docker backend (no root)
+
+An alternative to the netns harness for machines without root: the stack runs
+inside one container (publisher, relay, subscribers over loopback), netem is
+applied in-container via a file capability on `tc`, and the container runs as
+the invoking user. Binaries and run scripts are baked into the image, so
+rebuild after changing them.
+
+    docker compose build
+    ./run-matrix-docker.sh [config] [--block NAME] [--filter PAT] [--repeats N] [--dry-run]
+
+Experiments are defined in `docker-matrix.conf`. It imports the shared
+`conditions.conf` via the `conditions-file` directive, so both backends run
+the same named conditions; docker-only conditions can be added with
+`condition <name>|<netem rate delay [loss] [limit]>` (empty shape =
+unshaped). `[blocks]` each run as their own conditions x strategies x
+timeouts cross-product. Note the backends shape bandwidth differently (HTB
+here, netem rate in the container), so queueing behaviour is close but not
+identical across them. The netem `limit` field controls queue depth, which the netns
+harness's HTB shaping does not expose. Output lands under `results/`, same
+per-run layout as the netns harness.
+
 ## License
 
 MIT (see `LICENSE`).

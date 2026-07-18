@@ -1,0 +1,15 @@
+FROM golang:1.26-trixie AS build
+WORKDIR /src
+COPY moqtransport/ moqtransport/
+COPY moq-streaming/ moq-streaming/
+WORKDIR /src/moq-streaming
+RUN go build -o /out/moq-publisher ./cmd/publisher/ && go build -o /out/moq-relay ./cmd/relay/ && go build -o /out/moq-subscriber ./cmd/subscriber/
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends mpv ffmpeg iproute2 procps bsdextrautils libcap2-bin ca-certificates && rm -rf /var/lib/apt/lists/* && setcap cap_net_admin+ep "$(readlink -f "$(which tc)")"
+COPY --from=build /out/ /usr/local/bin/
+COPY moq-streaming/run-test.sh moq-streaming/net-shape.sh moq-streaming/exp-entry.sh /moq/
+COPY moq-streaming/subscriber/framelog.lua /moq/subscriber/framelog.lua
+WORKDIR /moq
+ENV PATH="/moq:${PATH}"
+CMD ["bash"]

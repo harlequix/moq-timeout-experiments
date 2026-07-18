@@ -1,0 +1,8 @@
+*
+!moq-streaming/**
+!moqtransport/**
+moq-streaming/testdata
+moq-streaming/results
+moq-streaming/moq-publisher
+moq-streaming/moq-relay
+moq-streaming/moq-subscriber

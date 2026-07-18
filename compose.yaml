@@ -1,0 +1,23 @@
+services:
+  experiment:
+    image: moq-experiments
+    build:
+      context: ..
+      dockerfile: moq-timeout-experiments/Dockerfile.experiments
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../moq-streaming/testdata:/moq/testdata:ro
+      - ./results:/moq/results
+    environment:
+      HOME: /tmp
+      SKIP_BUILD: "1"
+      BIN: /usr/local/bin
+      STRATEGY: ${STRATEGY:-none}
+      TIMEOUT: ${TIMEOUT:-0}
+      SHAPE: ${SHAPE:-}
+      VIDEO: ${VIDEO:-testdata/test_10s.mp4}
+      DURATION: ${DURATION:-15}
+      RUN_ID: ${RUN_ID:-}
+    command: exp-entry.sh
